@@ -9,8 +9,15 @@ policy:
   action_dim: 12
   action_horizon: 50
   vision_backbone: paligemma_2b
+  state_dim: 12
+  max_token_len: 192
+  model_action_dim: 32
+  model_state_dim: 32
+  image_resize_height: 224
+  image_resize_width: 224
+  adapter_recon_loss_weight: 0.05
 
-output_dir: outputs/train/kai0_lehome_run_03
+output_dir: outputs/train/kai0_lehome_run_06
 batch_size: 8
 steps: 30000
 save_freq: 5000

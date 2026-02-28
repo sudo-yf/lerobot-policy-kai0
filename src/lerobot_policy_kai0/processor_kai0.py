@@ -1,29 +1,19 @@
 from __future__ import annotations
 
-import inspect
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .configuration_kai0 import Kai0Config
-from openpi_client.image_tools import resize_with_pad
 
-try:
-    from openpi_client.action_chunk_broker import ActionChunkBroker as _OpenPIActionChunkBroker
-except Exception:
-    _OpenPIActionChunkBroker = None
-
-try:
-    from openpi.shared import image_tools as _openpi_image_tools
-except Exception:
-    _openpi_image_tools = None
+logger = logging.getLogger(__name__)
 
 
 class _SerializableCallableProcessor:
-    """Callable wrapper that can be saved by LeRobot checkpoints."""
-
     def __init__(self, fn, name: str, meta: dict | None = None):
         self._fn = fn
         self._name = name
@@ -45,137 +35,164 @@ class _SerializableCallableProcessor:
     def from_pretrained(cls, save_directory: str | Path, name: str):
         save_dir = Path(save_directory)
         data = json.loads((save_dir / f"{name}.json").read_text(encoding="utf-8"))
-        meta = data.get("meta", {})
-        fn = _build_processor_fn(name=name, meta=meta)
-        return cls(fn=fn, name=name, meta=meta)
+        fn = _build_processor_fn(name=name, meta=data.get("meta", {}))
+        return cls(fn=fn, name=name, meta=data.get("meta", {}))
 
 
-class _LocalChunkBroker:
-    """Compatibility broker for action-chunk tensors/arrays."""
-
+class _TemporalEnsemblingChunkBroker:
     def __init__(self, action_horizon: int):
         self.action_horizon = int(action_horizon)
-        self._cur_step = 0
-        self._last_chunk = None
+        self._chunks: list[tuple[torch.Tensor | np.ndarray, int]] = []
 
     def add_and_get_action(self, action_chunk):
-        if self._last_chunk is None:
-            self._last_chunk = action_chunk
-            self._cur_step = 0
+        self._chunks.append((action_chunk, 0))
+        candidates = self._collect_step_candidates()
+        if not candidates:
+            raise RuntimeError("No valid action step available in temporal broker")
+        return self._average_candidates(candidates)
 
-        out = self._last_chunk[self._cur_step]
-        self._cur_step += 1
+    def _collect_step_candidates(self):
+        candidates, updated = [], []
+        for chunk, step_index in self._chunks:
+            step = self._step_from_chunk(chunk, step_index)
+            if step is None:
+                continue
+            candidates.append(step)
+            if step_index + 1 < self._chunk_horizon(chunk):
+                updated.append((chunk, step_index + 1))
+        self._chunks = updated
+        logger.debug("[DEBUG] temporal broker active_chunks=%s candidates=%s", len(self._chunks), len(candidates))
+        return candidates
 
-        if self._cur_step >= self.action_horizon:
-            self._last_chunk = None
-            self._cur_step = 0
+    @staticmethod
+    def _step_from_chunk(chunk, step_index: int):
+        if torch.is_tensor(chunk):
+            if step_index >= chunk.shape[-2]:
+                return None
+            return chunk.select(dim=-2, index=step_index)
+        arr = np.asarray(chunk)
+        if step_index >= arr.shape[-2]:
+            return None
+        return np.take(arr, step_index, axis=-2)
 
+    @staticmethod
+    def _chunk_horizon(chunk) -> int:
+        return int(chunk.shape[-2] if torch.is_tensor(chunk) else np.asarray(chunk).shape[-2])
+
+    @staticmethod
+    def _average_candidates(candidates):
+        if torch.is_tensor(candidates[0]):
+            return torch.stack(candidates, dim=0).mean(dim=0)
+        return np.stack(candidates, axis=0).mean(axis=0)
+
+
+class _TorchImageResizer:
+    def __init__(self, target_h: int, target_w: int):
+        self.target_h = int(target_h)
+        self.target_w = int(target_w)
+
+    def resize_with_pad(self, img):
+        if torch.is_tensor(img):
+            return self._resize_tensor(img)
+        return self._resize_numpy(img)
+
+    def _resize_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        canonical, was_chw = self._to_hwc_layout(tensor)
+        resized = self._resize_hwc_tensor(canonical)
+        return resized.movedim(-1, -3) if was_chw else resized
+
+    def _resize_numpy(self, array_like) -> np.ndarray:
+        arr = np.asarray(array_like)
+        was_chw = arr.ndim >= 3 and arr.shape[-1] not in (1, 3, 4) and arr.shape[-3] in (1, 3, 4)
+        if was_chw:
+            arr = np.moveaxis(arr, -3, -1)
+        out = self._resize_hwc_tensor(torch.from_numpy(arr)).cpu().numpy()
+        return np.moveaxis(out, -1, -3) if was_chw else out
+
+    @staticmethod
+    def _to_hwc_layout(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
+        was_chw = tensor.ndim >= 3 and tensor.shape[-1] not in (1, 3, 4) and tensor.shape[-3] in (1, 3, 4)
+        return (tensor.movedim(-3, -1), True) if was_chw else (tensor, False)
+
+    def _resize_hwc_tensor(self, image_hwc: torch.Tensor) -> torch.Tensor:
+        if image_hwc.ndim < 3:
+            raise ValueError(f"Expected image ndim>=3, got {image_hwc.ndim}")
+        h, w = image_hwc.shape[-3], image_hwc.shape[-2]
+        lead = image_hwc.shape[:-3]
+        n = int(np.prod(lead)) if lead else 1
+        orig_dtype = image_hwc.dtype
+
+        nchw = image_hwc.reshape(n, h, w, image_hwc.shape[-1]).permute(0, 3, 1, 2).contiguous()
+        nchw = self._to_interpolation_dtype(nchw)
+        resized = self._interpolate_keep_ratio(nchw, h, w)
+        padded = self._pad_to_target(resized)
+        hwc = padded.permute(0, 2, 3, 1).reshape(*lead, self.target_h, self.target_w, image_hwc.shape[-1])
+        out = self._to_original_dtype(hwc, orig_dtype)
+
+        logger.debug(
+            "[DEBUG] image resize_with_pad: in_shape=%s out_shape=%s dtype=%s",
+            tuple(image_hwc.shape),
+            tuple(out.shape),
+            str(orig_dtype),
+        )
         return out
 
+    @staticmethod
+    def _to_interpolation_dtype(nchw: torch.Tensor) -> torch.Tensor:
+        if torch.is_floating_point(nchw):
+            return nchw.to(torch.float32)
+        return nchw.to(torch.float32) / 255.0
 
-def _build_chunk_broker(config: Kai0Config):
-    if _OpenPIActionChunkBroker is not None:
-        try:
-            sig = inspect.signature(_OpenPIActionChunkBroker.__init__)
-            params = sig.parameters
-            if "policy" not in params:
-                broker = _OpenPIActionChunkBroker(action_horizon=config.action_horizon)
-                if hasattr(broker, "add_and_get_action"):
-                    return broker
-        except Exception:
-            pass
-    return _LocalChunkBroker(action_horizon=config.action_horizon)
+    def _interpolate_keep_ratio(self, nchw: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        scale = min(self.target_h / float(h), self.target_w / float(w))
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        return F.interpolate(nchw, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True)
 
+    def _pad_to_target(self, resized: torch.Tensor) -> torch.Tensor:
+        pad_h = self.target_h - resized.shape[-2]
+        pad_w = self.target_w - resized.shape[-1]
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        return F.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0)
 
-def _resize_image_like_kai0(img, target_h=224, target_w=224):
-    """Accept torch/numpy, CHW or HWC, preserve input type/layout with minimal distortion."""
-    is_torch = torch.is_tensor(img)
-    was_chw = False
-
-    if is_torch:
-        t = img
-        if t.ndim >= 3 and t.shape[-1] not in (1, 3, 4) and t.shape[-3] in (1, 3, 4):
-            t = t.movedim(-3, -1)
-            was_chw = True
-
-        # Prefer torch-native resize path to avoid float->uint8 quantization.
-        if _openpi_image_tools is not None and hasattr(_openpi_image_tools, "resize_with_pad_torch"):
-            t_resized = _openpi_image_tools.resize_with_pad_torch(t, target_h, target_w)
-        else:
-            arr = t.detach().cpu().numpy()
-            arr = _resize_numpy_fallback(arr, target_h, target_w)
-            t_resized = torch.from_numpy(arr).to(device=t.device, dtype=t.dtype)
-
-        if was_chw:
-            t_resized = t_resized.movedim(-1, -3)
-        return t_resized
-
-    arr = np.asarray(img)
-    if arr.ndim >= 3 and arr.shape[-1] not in (1, 3, 4) and arr.shape[-3] in (1, 3, 4):
-        arr = np.moveaxis(arr, -3, -1)
-        was_chw = True
-
-    arr = _resize_numpy_fallback(arr, target_h, target_w)
-
-    if was_chw:
-        arr = np.moveaxis(arr, -1, -3)
-    return arr
-
-
-def _resize_numpy_fallback(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Fallback PIL-based resize, with best-effort dtype/domain preservation."""
-    orig_dtype = arr.dtype
-    scale01 = False
-
-    if np.issubdtype(arr.dtype, np.floating):
-        finite = np.isfinite(arr)
-        vmax = float(arr[finite].max()) if finite.any() else 1.0
-        vmin = float(arr[finite].min()) if finite.any() else 0.0
-        if vmin >= 0.0 and vmax <= 1.5:
-            scale01 = True
-            arr_u8 = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-        else:
-            arr_u8 = np.clip(arr, 0, 255).astype(np.uint8)
-    else:
-        arr_u8 = arr.astype(np.uint8, copy=False)
-
-    out = resize_with_pad(arr_u8, target_h, target_w)
-
-    if np.issubdtype(orig_dtype, np.floating):
-        out = out.astype(orig_dtype)
-        if scale01:
-            out = out / 255.0
-    return out
+    @staticmethod
+    def _to_original_dtype(tensor: torch.Tensor, original_dtype: torch.dtype) -> torch.Tensor:
+        if original_dtype == torch.uint8:
+            return (tensor * 255.0).clamp(0, 255).round().to(torch.uint8)
+        return tensor.to(original_dtype)
 
 
 def make_kai0_pre_post_processors(config: Kai0Config, dataset_stats=None):
     _ = dataset_stats
-
-    view_to_openpi = {
-        "observation.images.top_rgb": "base_0_rgb",
-        "observation.images.left_rgb": "left_wrist_0_rgb",
-        "observation.images.right_rgb": "right_wrist_0_rgb",
-    }
+    required_views = [
+        "observation.images.top_rgb",
+        "observation.images.left_rgb",
+        "observation.images.right_rgb",
+    ]
+    resizer = _TorchImageResizer(config.image_resize_height, config.image_resize_width)
+    broker = _TemporalEnsemblingChunkBroker(action_horizon=config.action_horizon)
 
     def pre_process(batch):
-        # 三视角都做同样 resize，避免单视角伪装
-        for key in view_to_openpi:
+        for key in required_views:
             if key not in batch:
                 raise KeyError(f"Missing required image key: {key}")
-            batch[key] = _resize_image_like_kai0(batch[key], 224, 224)
+            batch[key] = resizer.resize_with_pad(batch[key])
         return batch
 
-    broker = _build_chunk_broker(config)
-
     def post_process(action_chunk):
-        if hasattr(broker, "add_and_get_action"):
-            return broker.add_and_get_action(action_chunk)
-        return action_chunk
+        return broker.add_and_get_action(action_chunk)
 
     pre = _SerializableCallableProcessor(
         pre_process,
         name="policy_preprocessor",
-        meta={"type": "kai0", "resize": [224, 224], "required_views": list(view_to_openpi.keys())},
+        meta={
+            "type": "kai0",
+            "resize": [config.image_resize_height, config.image_resize_width],
+            "required_views": required_views,
+        },
     )
     post = _SerializableCallableProcessor(
         post_process,
@@ -188,25 +205,23 @@ def make_kai0_pre_post_processors(config: Kai0Config, dataset_stats=None):
 def _build_processor_fn(name: str, meta: dict):
     if name == "policy_preprocessor":
         resize = meta.get("resize", [224, 224])
-        h = int(resize[0])
-        w = int(resize[1])
         required_views = meta.get(
             "required_views",
             ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"],
         )
+        resizer = _TorchImageResizer(int(resize[0]), int(resize[1]))
 
         def _pre(batch):
             for key in required_views:
                 if key not in batch:
                     raise KeyError(f"Missing required image key: {key}")
-                batch[key] = _resize_image_like_kai0(batch[key], h, w)
+                batch[key] = resizer.resize_with_pad(batch[key])
             return batch
 
         return _pre
 
     if name == "policy_postprocessor":
-        horizon = int(meta.get("action_horizon", 50))
-        broker = _LocalChunkBroker(action_horizon=horizon)
+        broker = _TemporalEnsemblingChunkBroker(action_horizon=int(meta.get("action_horizon", 50)))
 
         def _post(action_chunk):
             return broker.add_and_get_action(action_chunk)
