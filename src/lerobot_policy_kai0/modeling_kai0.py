@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -27,10 +28,13 @@ class Kai0Policy(PreTrainedPolicy):
     ):
         super().__init__(config, dataset_stats=dataset_stats, dataset_meta=dataset_meta, **kwargs)
         self.model = PI0Pytorch(config.to_openpi_config())
+        self._tokenizer = None
 
         if hasattr(config, "pretrained_path") and config.pretrained_path:
-            state_dict = torch.load(config.pretrained_path, map_location="cpu")
-            self.model.load_state_dict(state_dict)
+            ckpt_path = Path(config.pretrained_path)
+            if ckpt_path.is_file():
+                state_dict = torch.load(ckpt_path, map_location="cpu")
+                self.model.load_state_dict(state_dict)
 
     def get_optim_params(self) -> dict:
         return [{"params": [p for p in self.parameters() if p.requires_grad]}]
@@ -47,7 +51,6 @@ class Kai0Policy(PreTrainedPolicy):
         return torch.nn.functional.pad(x, (0, pad))
 
     def _build_openpi_observation(self, batch: dict[str, torch.Tensor]) -> SimpleNamespace:
-        # state
         state = batch.get("observation.state", batch.get("state"))
         if state is None:
             raise KeyError("Missing 'observation.state' in batch")
@@ -55,32 +58,63 @@ class Kai0Policy(PreTrainedPolicy):
             state = state.unsqueeze(0)
         state = self._pad_last_dim(state.to(torch.float32), 32)
 
-        # images: map LeHome top camera to OpenPI camera keys
-        top = batch.get("observation.images.top_rgb")
-        if top is None:
-            raise KeyError("Missing 'observation.images.top_rgb' in batch")
-        if top.ndim == 3:
-            top = top.unsqueeze(0)
+        def _get_img(required_key: str, aliases: list[str]) -> torch.Tensor:
+            for key in [required_key, *aliases]:
+                value = batch.get(key)
+                if value is not None:
+                    if value.ndim == 3:
+                        return value.unsqueeze(0)
+                    return value
+            raise KeyError(f"Missing required camera input: {required_key} (aliases={aliases})")
+
+        # 三个视角严格对齐，不做 top 复用伪装
+        top = _get_img("observation.images.top_rgb", ["observation.images.top"])
+        left = _get_img("observation.images.left_rgb", ["observation.images.wrist_left", "observation.images.left"])
+        right = _get_img("observation.images.right_rgb", ["observation.images.wrist_right", "observation.images.right"])
 
         images = {
             "base_0_rgb": top,
-            "left_wrist_0_rgb": top,
-            "right_wrist_0_rgb": top,
+            "left_wrist_0_rgb": left,
+            "right_wrist_0_rgb": right,
         }
 
         bsz = state.shape[0]
         device = state.device
         image_masks = {k: torch.ones(bsz, dtype=torch.bool, device=device) for k in images}
 
-        # tokenized prompt fallback
         tokenized_prompt = batch.get("tokenized_prompt")
         tokenized_prompt_mask = batch.get("tokenized_prompt_mask")
         token_ar_mask = batch.get("token_ar_mask")
         token_loss_mask = batch.get("token_loss_mask")
 
         if tokenized_prompt is None or tokenized_prompt_mask is None:
-            tokenized_prompt = torch.zeros((bsz, 1), dtype=torch.int32, device=device)
-            tokenized_prompt_mask = torch.ones((bsz, 1), dtype=torch.bool, device=device)
+            prompt_obj = batch.get("prompt", batch.get("task", batch.get("task_description")))
+            if prompt_obj is None:
+                raise KeyError(
+                    "Missing tokenized_prompt/tokenized_prompt_mask and no prompt/task/task_description provided."
+                )
+
+            if self._tokenizer is None:
+                from openpi.models.tokenizer import PaligemmaTokenizer
+
+                max_len = int(getattr(self.model.config, "max_token_len", 200) or 200)
+                self._tokenizer = PaligemmaTokenizer(max_len=max_len)
+
+            if isinstance(prompt_obj, (list, tuple)):
+                prompts = [str(x) for x in prompt_obj]
+            else:
+                prompts = [str(prompt_obj)] * bsz
+            if len(prompts) != bsz:
+                prompts = (prompts + [prompts[-1]])[:bsz]
+
+            token_list = []
+            mask_list = []
+            for i, text in enumerate(prompts):
+                token_np, mask_np = self._tokenizer.tokenize(text, state[i].detach().cpu().numpy())
+                token_list.append(torch.as_tensor(token_np, dtype=torch.int32, device=device))
+                mask_list.append(torch.as_tensor(mask_np, dtype=torch.bool, device=device))
+            tokenized_prompt = torch.stack(token_list, dim=0)
+            tokenized_prompt_mask = torch.stack(mask_list, dim=0)
         else:
             tokenized_prompt = tokenized_prompt.to(device=device, dtype=torch.int32)
             tokenized_prompt_mask = tokenized_prompt_mask.to(device=device, dtype=torch.bool)
@@ -115,7 +149,6 @@ class Kai0Policy(PreTrainedPolicy):
         actions = actions.to(torch.float32)
         actions = self._pad_last_dim(actions, 32)
 
-        # Ensure horizon matches model config.
         horizon = int(getattr(self.model.config, "action_horizon", actions.shape[1]))
         if actions.shape[1] < horizon:
             pad = horizon - actions.shape[1]
@@ -143,11 +176,13 @@ class Kai0Policy(PreTrainedPolicy):
         self.eval()
         observation = self._build_openpi_observation(batch)
         device = next(self.model.parameters()).device
-        return self.model.sample_actions(device, observation)
+
+        if hasattr(self.model, "sample_actions"):
+            return self.model.sample_actions(device, observation)
+        return self.model.generate(observation)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         _ = kwargs
         action_chunk = self.predict_action_chunk(batch)
-        # Export competition action dim only.
         return action_chunk[..., : self.config.action_dim]

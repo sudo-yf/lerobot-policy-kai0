@@ -1,108 +1,72 @@
 # lerobot-policy-kai0
 
-这个仓库现在以“根目录即可用”为目标组织：你克隆后不需要再点进子目录，直接在仓库根目录就能看到并使用 Kai0 的 LeRobot 插件。
+Kai0 (`PI0Pytorch`) 的 LeRobot 插件，按 LeHome 环境做最小适配，保持 Kai0 推理/训练接口一致。
 
-## 仓库根目录内容
+## 目录
 
-- `pyproject.toml`：插件打包定义
-- `src/lerobot_policy_kai0/`：插件源码
-- `train_kai0.yaml`：可直接用的训练配置
-- `README.md`：启动方法 + 全部映射与适配说明
+- `pyproject.toml`
+- `src/lerobot_policy_kai0/__init__.py`
+- `src/lerobot_policy_kai0/configuration_kai0.py`
+- `src/lerobot_policy_kai0/modeling_kai0.py`
+- `src/lerobot_policy_kai0/processor_kai0.py`
+- `train_kai0.yaml`
 
-## 一键启动（LeHome）
+## 核心适配
 
-假设你的训练工程目录是 `lehome-challenge`：
+### 1) 配置层 (`configuration_kai0.py`)
+
+- 注册 `kai0`：`@PreTrainedConfig.register_subclass("kai0")`
+- `to_openpi_config()` -> `openpi.models.pi0_config.Pi0Config`
+- `input_features`/`output_features` 使用 LeRobot `PolicyFeature` 类型（不是裸 dict）
+- 默认三路视觉 + 状态：
+  - `observation.images.top_rgb`
+  - `observation.images.left_rgb`
+  - `observation.images.right_rgb`
+  - `observation.state`
+
+### 2) 模型层 (`modeling_kai0.py`)
+
+- 直接封装 `PI0Pytorch`
+- LeRobot batch -> Kai0 observation/actions 适配
+- 三视角严格映射（不做 top 伪装）：
+  - `observation.images.top_rgb` -> `base_0_rgb`
+  - `observation.images.left_rgb` -> `left_wrist_0_rgb`
+  - `observation.images.right_rgb` -> `right_wrist_0_rgb`
+- 动作维度对齐：外部 `action_dim=12`，内部 pad/crop 到 32 通道供 Kai0 计算
+- prompt 处理：优先用 batch 里的 token 字段；缺失时走 `PaligemmaTokenizer`
+
+### 3) 处理器层 (`processor_kai0.py`)
+
+- 预处理：三路图像都做 `resize_with_pad -> 224x224`
+- 后处理：`ActionChunkBroker` 版本兼容（不兼容时回退本地 broker）
+- 返回可序列化 processor（含 `save_pretrained/from_pretrained`），保证 checkpoint/save/load 与评估脚本兼容
+
+## 训练（LeHome）
+
+先安装插件（编辑模式）：
+
+```bash
+pip install -e /root/data/lerobot_policy_kai0
+```
+
+建议在 `lehome-challenge` 下运行，并把日志写到 `logs/`：
 
 ```bash
 cd /root/data/lehome-challenge
 source .venv/bin/activate
-pip install -e /root/data/lerobot-policy-kai0
-lerobot-train --config_path=/root/data/lerobot-policy-kai0/train_kai0.yaml
-```
-
-建议把日志落盘：
-
-```bash
 mkdir -p logs
-lerobot-train --config_path=/root/data/lerobot-policy-kai0/train_kai0.yaml 2>&1 | tee logs/train_kai0_$(date +%m-%d_%H-%M-%S).log
+lerobot-train --config_path=configs/train_kai0_run2.yaml \
+  2>&1 | tee logs/train_kai0_$(date +%m-%d_%H-%M-%S).log
 ```
 
-## 这套封装做了什么适配
+注意：`--config_path` 请用 `lehome-challenge` 内的相对路径（如 `configs/...`），不要直接传绝对路径给 `lerobot-train`，否则会被当成 HuggingFace repo id。
 
-### 1. `configuration_kai0.py` 适配
+## 当前已验证
 
-目标：对齐 LeRobot 抽象配置接口，并桥接 Kai0 配置对象。
+- 训练可正常进入 loop
+- `save_pretrained` 路径可用
+- smoke 跑通并成功落地 checkpoint（`000050`）
 
-- 注册策略类型：`@PreTrainedConfig.register_subclass("kai0")`
-- `to_openpi_config()` 双路径兼容：
-  - 优先 `openpi.models_pytorch.pi0_pytorch.PI0Config`
-  - 回退 `openpi.models.pi0_config.Pi0Config`
-- 补齐 LeRobot 新版要求的抽象项：
-  - `get_optimizer_preset`
-  - `get_scheduler_preset`
-  - `observation_delta_indices`
-  - `action_delta_indices`
-  - `reward_delta_indices`
-  - `validate_features`
+## 已知现象
 
-### 2. `modeling_kai0.py` 适配
-
-目标：把 LeRobot batch 转成 Kai0 `PI0Pytorch` 真实可吃的输入。
-
-- 对齐 LeRobot policy 抽象方法：
-  - `get_optim_params`
-  - `predict_action_chunk`
-  - `reset`
-- `__init__` 兼容工厂注入参数：`dataset_meta` / `**kwargs`
-- 训练路径适配：
-  - LeRobot 传入 `batch`
-  - 适配后调用 `self.model(observation, actions)`（而不是直接 `self.model(batch)`）
-- 推理路径适配：
-  - 优先 `sample_actions(device, observation)`
-  - 若版本提供 `generate` 则自动回退兼容
-- 维度映射：
-  - 外部比赛动作 `12` 维 -> 内部 Kai0 计算通道 `32` 维（pad/crop）
-  - `action_horizon` 自动对齐（不足复制末帧补齐，过长截断）
-- 视觉键映射（单相机最小可跑策略）：
-  - `observation.images.top_rgb` ->
-    - `base_0_rgb`
-    - `left_wrist_0_rgb`
-    - `right_wrist_0_rgb`
-
-### 3. `processor_kai0.py` 适配
-
-目标：统一处理 openpi_client 版本差异和图像类型差异。
-
-- `ActionChunkBroker` 版本兼容：
-  - 老版本：`ActionChunkBroker(action_horizon=...)`
-  - 新版本：`ActionChunkBroker(policy, action_horizon)`
-  - 处理方法：检测签名，若不兼容则使用本地 `_LocalChunkBroker` 保持 `add_and_get_action` 行为
-- 图像 resize 适配：
-  - 支持 `torch.Tensor` 和 `numpy.ndarray`
-  - 支持 `CHW/HWC`
-  - float 图像先转 `uint8` 走 PIL resize，再转回原 dtype/域
-  - 固定 resize 到 `224x224`（Kai0 期望分辨率）
-
-## 已解决的典型崩溃点
-
-- `ActionChunkBroker.__init__() missing required positional argument: 'policy'`
-- `PI0Pytorch.forward() missing 1 required positional argument: 'actions'`
-- `AttributeError: 'Tensor' object has no attribute '__array_interface__'`
-- `TypeError: Cannot handle this data type: (1, 1, 3), <f4`
-- `Can't instantiate abstract class Kai0Config ...`
-- `Kai0Policy.__init__() got an unexpected keyword argument 'dataset_meta'`
-
-## 训练配置说明（`train_kai0.yaml`）
-
-- 数据默认指向本地：`Datasets/example/top_long_merged`
-- `policy.type: kai0`
-- `action_dim: 12`
-- `action_horizon: 50`
-- `wandb.enable: false`（你可以自行改成 `true`）
-
-## 备注
-
-这份插件是“适配层”实现：
-- 保留 Kai0 模型主逻辑（`PI0Pytorch`）
-- 在 LeRobot 与 openpi_client 版本漂移的边界做防护和映射
-- 目标是让训练命令稳定跑通，而不是改写 Kai0 本体算法
+- 日志中会出现 tokenizer truncation 警告（`max_token_len=48`），不阻塞训练；若你希望保留更长文本语义，可再调大该长度。

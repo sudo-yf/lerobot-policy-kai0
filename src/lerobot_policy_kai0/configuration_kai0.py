@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
@@ -8,25 +9,23 @@ from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 @PreTrainedConfig.register_subclass("kai0")
 @dataclass
 class Kai0Config(PreTrainedConfig):
-    # 模型架构
     model_type: str = "pi0"
     vision_backbone: str = "paligemma_2b"
     action_horizon: int = 50
-
-    # 比赛特定的动作空间 (LeHome 推荐双臂 12 维)
     action_dim: int = 12
 
-    # 输入特征配置
-    input_features: dict = field(
+    input_features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
-            "observation.images.top_rgb": {"type": "VISUAL", "shape": [3, 480, 640]},
-            "observation.state": {"type": "STATE", "shape": [12]},
+            "observation.images.top_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+            "observation.images.left_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+            "observation.images.right_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(12,)),
         }
     )
 
-    output_features: dict = field(
+    output_features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
-            "action": {"type": "ACTION", "shape": [12]},
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(12,)),
         }
     )
 
@@ -41,13 +40,11 @@ class Kai0Config(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     def to_openpi_config(self):
-        # 这里的转换逻辑必须与 Kai0 的 pi0_pytorch.py 预期一致
         from openpi.models.pi0_config import Pi0Config
 
         return Pi0Config(
             action_dim=self.action_dim,
             action_horizon=self.action_horizon,
-            # 其他 Kai0 原生参数...
         )
 
     def get_optimizer_preset(self) -> AdamWConfig:

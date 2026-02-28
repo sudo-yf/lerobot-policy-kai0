@@ -6,30 +6,11 @@ policy:
   type: kai0
   device: cuda
   push_to_hub: false
-
   action_dim: 12
   action_horizon: 50
   vision_backbone: paligemma_2b
 
-  input_features:
-    observation.state:
-      type: STATE
-      shape: [12]
-    observation.images.top_rgb:
-      type: VISUAL
-      shape: [3, 480, 640]
-
-  output_features:
-    action:
-      type: ACTION
-      shape: [12]
-
-rename_map:
-  observation.images.left_rgb: observation.images.left_rgb
-  observation.images.right_rgb: observation.images.right_rgb
-  observation.top_depth: observation.top_depth
-
-output_dir: outputs/train/kai0_lehome_run_01
+output_dir: outputs/train/kai0_lehome_run_03
 batch_size: 8
 steps: 30000
 save_freq: 5000

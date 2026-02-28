@@ -15,6 +15,11 @@ try:
 except Exception:
     _OpenPIActionChunkBroker = None
 
+try:
+    from openpi.shared import image_tools as _openpi_image_tools
+except Exception:
+    _openpi_image_tools = None
+
 
 class _SerializableCallableProcessor:
     """Callable wrapper that can be saved by LeRobot checkpoints."""
@@ -83,25 +88,45 @@ def _build_chunk_broker(config: Kai0Config):
 
 
 def _resize_image_like_kai0(img, target_h=224, target_w=224):
-    """Accept torch/numpy, CHW or HWC, preserve input type/layout."""
+    """Accept torch/numpy, CHW or HWC, preserve input type/layout with minimal distortion."""
     is_torch = torch.is_tensor(img)
     was_chw = False
 
     if is_torch:
-        device = img.device
-        dtype = img.dtype
-        arr = img.detach().cpu().numpy()
-    else:
-        arr = np.asarray(img)
+        t = img
+        if t.ndim >= 3 and t.shape[-1] not in (1, 3, 4) and t.shape[-3] in (1, 3, 4):
+            t = t.movedim(-3, -1)
+            was_chw = True
 
-    # Detect CHW family and convert to HWC for openpi_client
+        # Prefer torch-native resize path to avoid float->uint8 quantization.
+        if _openpi_image_tools is not None and hasattr(_openpi_image_tools, "resize_with_pad_torch"):
+            t_resized = _openpi_image_tools.resize_with_pad_torch(t, target_h, target_w)
+        else:
+            arr = t.detach().cpu().numpy()
+            arr = _resize_numpy_fallback(arr, target_h, target_w)
+            t_resized = torch.from_numpy(arr).to(device=t.device, dtype=t.dtype)
+
+        if was_chw:
+            t_resized = t_resized.movedim(-1, -3)
+        return t_resized
+
+    arr = np.asarray(img)
     if arr.ndim >= 3 and arr.shape[-1] not in (1, 3, 4) and arr.shape[-3] in (1, 3, 4):
         arr = np.moveaxis(arr, -3, -1)
         was_chw = True
 
-    # PIL backend needs uint8/compatible dtypes. Preserve original numeric domain.
+    arr = _resize_numpy_fallback(arr, target_h, target_w)
+
+    if was_chw:
+        arr = np.moveaxis(arr, -1, -3)
+    return arr
+
+
+def _resize_numpy_fallback(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """Fallback PIL-based resize, with best-effort dtype/domain preservation."""
     orig_dtype = arr.dtype
     scale01 = False
+
     if np.issubdtype(arr.dtype, np.floating):
         finite = np.isfinite(arr)
         vmax = float(arr[finite].max()) if finite.any() else 1.0
@@ -114,27 +139,30 @@ def _resize_image_like_kai0(img, target_h=224, target_w=224):
     else:
         arr_u8 = arr.astype(np.uint8, copy=False)
 
-    arr = resize_with_pad(arr_u8, target_h, target_w)
+    out = resize_with_pad(arr_u8, target_h, target_w)
 
     if np.issubdtype(orig_dtype, np.floating):
-        arr = arr.astype(orig_dtype)
+        out = out.astype(orig_dtype)
         if scale01:
-            arr = arr / 255.0
-
-    if was_chw:
-        arr = np.moveaxis(arr, -1, -3)
-
-    if is_torch:
-        return torch.from_numpy(arr).to(device=device, dtype=dtype)
-    return arr
+            out = out / 255.0
+    return out
 
 
 def make_kai0_pre_post_processors(config: Kai0Config, dataset_stats=None):
     _ = dataset_stats
 
+    view_to_openpi = {
+        "observation.images.top_rgb": "base_0_rgb",
+        "observation.images.left_rgb": "left_wrist_0_rgb",
+        "observation.images.right_rgb": "right_wrist_0_rgb",
+    }
+
     def pre_process(batch):
-        img = batch["observation.images.top_rgb"]
-        batch["observation.images.top_rgb"] = _resize_image_like_kai0(img, 224, 224)
+        # 三视角都做同样 resize，避免单视角伪装
+        for key in view_to_openpi:
+            if key not in batch:
+                raise KeyError(f"Missing required image key: {key}")
+            batch[key] = _resize_image_like_kai0(batch[key], 224, 224)
         return batch
 
     broker = _build_chunk_broker(config)
@@ -147,7 +175,7 @@ def make_kai0_pre_post_processors(config: Kai0Config, dataset_stats=None):
     pre = _SerializableCallableProcessor(
         pre_process,
         name="policy_preprocessor",
-        meta={"type": "kai0", "resize": [224, 224]},
+        meta={"type": "kai0", "resize": [224, 224], "required_views": list(view_to_openpi.keys())},
     )
     post = _SerializableCallableProcessor(
         post_process,
@@ -162,10 +190,16 @@ def _build_processor_fn(name: str, meta: dict):
         resize = meta.get("resize", [224, 224])
         h = int(resize[0])
         w = int(resize[1])
+        required_views = meta.get(
+            "required_views",
+            ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"],
+        )
 
         def _pre(batch):
-            img = batch["observation.images.top_rgb"]
-            batch["observation.images.top_rgb"] = _resize_image_like_kai0(img, h, w)
+            for key in required_views:
+                if key not in batch:
+                    raise KeyError(f"Missing required image key: {key}")
+                batch[key] = _resize_image_like_kai0(batch[key], h, w)
             return batch
 
         return _pre
