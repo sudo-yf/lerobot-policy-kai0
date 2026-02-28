@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -12,6 +14,35 @@ try:
     from openpi_client.action_chunk_broker import ActionChunkBroker as _OpenPIActionChunkBroker
 except Exception:
     _OpenPIActionChunkBroker = None
+
+
+class _SerializableCallableProcessor:
+    """Callable wrapper that can be saved by LeRobot checkpoints."""
+
+    def __init__(self, fn, name: str, meta: dict | None = None):
+        self._fn = fn
+        self._name = name
+        self._meta = meta or {}
+
+    def __call__(self, data):
+        return self._fn(data)
+
+    def save_pretrained(self, save_directory: str | Path):
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        out = save_dir / f"{self._name}.json"
+        out.write_text(
+            json.dumps({"name": self._name, "meta": self._meta}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def from_pretrained(cls, save_directory: str | Path, name: str):
+        save_dir = Path(save_directory)
+        data = json.loads((save_dir / f"{name}.json").read_text(encoding="utf-8"))
+        meta = data.get("meta", {})
+        fn = _build_processor_fn(name=name, meta=meta)
+        return cls(fn=fn, name=name, meta=meta)
 
 
 class _LocalChunkBroker:
@@ -113,4 +144,45 @@ def make_kai0_pre_post_processors(config: Kai0Config, dataset_stats=None):
             return broker.add_and_get_action(action_chunk)
         return action_chunk
 
-    return pre_process, post_process
+    pre = _SerializableCallableProcessor(
+        pre_process,
+        name="policy_preprocessor",
+        meta={"type": "kai0", "resize": [224, 224]},
+    )
+    post = _SerializableCallableProcessor(
+        post_process,
+        name="policy_postprocessor",
+        meta={"type": "kai0", "action_horizon": int(config.action_horizon)},
+    )
+    return pre, post
+
+
+def _build_processor_fn(name: str, meta: dict):
+    if name == "policy_preprocessor":
+        resize = meta.get("resize", [224, 224])
+        h = int(resize[0])
+        w = int(resize[1])
+
+        def _pre(batch):
+            img = batch["observation.images.top_rgb"]
+            batch["observation.images.top_rgb"] = _resize_image_like_kai0(img, h, w)
+            return batch
+
+        return _pre
+
+    if name == "policy_postprocessor":
+        horizon = int(meta.get("action_horizon", 50))
+        broker = _LocalChunkBroker(action_horizon=horizon)
+
+        def _post(action_chunk):
+            return broker.add_and_get_action(action_chunk)
+
+        return _post
+
+    raise ValueError(f"Unknown processor name: {name}")
+
+
+def load_kai0_pre_post_processors(save_directory: str | Path):
+    pre = _SerializableCallableProcessor.from_pretrained(save_directory, "policy_preprocessor")
+    post = _SerializableCallableProcessor.from_pretrained(save_directory, "policy_postprocessor")
+    return pre, post
