@@ -2,20 +2,14 @@
 name = "lerobot_policy_kai0"
 version = "0.1.0"
 description = "Kai0 VLA policy plugin for LeRobot"
-requires-python = ">=3.10"
 dependencies = [
-  "torch>=2.2.0",
-  "transformers>=4.40.0",
-  "lerobot",
-  "openpi",
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "lerobot",
+    "openpi", # 假设你已在 Kai0/src 下执行 pip install -e .
 ]
+requires-python = ">=3.10"
 
 [build-system]
-requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
+requires = ["setuptools>=64"]
